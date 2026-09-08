@@ -96,6 +96,19 @@ class DashboardSettingsResponse(DashboardModel):
     version: int = Field(ge=1)
 
 
+#: ``DashboardSettingsUpdateRequest`` fields that change the security posture of
+#: the install. A request that changes any of them (value differs from the
+#: stored setting) requires ``security:write`` on top of the generic write gate.
+SECURITY_SETTINGS_FIELDS: frozenset[str] = frozenset(
+    {
+        "totp_required_on_login",
+        "api_key_auth_enabled",
+        "guest_access_enabled",
+        "dashboard_session_ttl_seconds",
+    }
+)
+
+
 class DashboardSettingsUpdateRequest(DashboardModel):
     expected_version: int | None = Field(default=None, ge=1)
     sticky_threads_enabled: bool | None = None
