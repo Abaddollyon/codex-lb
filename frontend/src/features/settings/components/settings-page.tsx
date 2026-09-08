@@ -49,17 +49,20 @@ export function SettingsPage() {
   const { settingsQuery, updateSettingsMutation } = useSettings();
   const [initialRetryError, setInitialRetryError] = useState<string | null>(null);
   const { accountsQuery } = useAccounts();
+  const authMode = useAuthStore((state) => state.authMode);
+  const passwordManagementEnabled = useAuthStore((state) => state.passwordManagementEnabled);
+  const passwordSessionActive = useAuthStore((state) => state.passwordSessionActive);
+  const canWrite = useAuthStore((state) => state.canWrite);
+  // API keys, upstream-proxy administration, and sticky sessions are write-only
+  // reads on the backend (403 for guests), so they are not mounted or fetched
+  // without write access.
   const {
     upstreamProxyQuery,
     createEndpointMutation,
     createPoolMutation,
     addPoolMemberMutation,
     testEndpointMutation,
-  } = useUpstreamProxyAdmin();
-  const authMode = useAuthStore((state) => state.authMode);
-  const passwordManagementEnabled = useAuthStore((state) => state.passwordManagementEnabled);
-  const passwordSessionActive = useAuthStore((state) => state.passwordSessionActive);
-  const canWrite = useAuthStore((state) => state.canWrite);
+  } = useUpstreamProxyAdmin({ enabled: canWrite });
 
   const settings = settingsQuery.data;
   const busy =
@@ -167,17 +170,19 @@ export function SettingsPage() {
               </Suspense>
             ) : null}
 
-            <ApiKeysSection
-              apiKeyAuthEnabled={settings.apiKeyAuthEnabled}
-              hideUpstreamQuotaFromApiKeys={settings.hideUpstreamQuotaFromApiKeys}
-              disabled={controlsDisabled}
-              onApiKeyAuthEnabledChange={(enabled) =>
-                void handleSave(buildSettingsUpdateRequest(settings, { apiKeyAuthEnabled: enabled }))
-              }
-              onHideUpstreamQuotaFromApiKeysChange={(enabled) =>
-                void handleSave(buildSettingsUpdateRequest(settings, { hideUpstreamQuotaFromApiKeys: enabled }))
-              }
-            />
+            {canWrite ? (
+              <ApiKeysSection
+                apiKeyAuthEnabled={settings.apiKeyAuthEnabled}
+                hideUpstreamQuotaFromApiKeys={settings.hideUpstreamQuotaFromApiKeys}
+                disabled={controlsDisabled}
+                onApiKeyAuthEnabledChange={(enabled) =>
+                  void handleSave(buildSettingsUpdateRequest(settings, { apiKeyAuthEnabled: enabled }))
+                }
+                onHideUpstreamQuotaFromApiKeysChange={(enabled) =>
+                  void handleSave(buildSettingsUpdateRequest(settings, { hideUpstreamQuotaFromApiKeys: enabled }))
+                }
+              />
+            ) : null}
 
             <TelemetrySettings disabled={controlsDisabled} />
 
@@ -228,7 +233,7 @@ export function SettingsPage() {
               <ModelSourcesSettings disabled={controlsDisabled} />
               <FirewallSection disabled={controlsDisabled} />
               <QuotaPlannerSection disabled={controlsDisabled} />
-              <StickySessionsSection disabled={controlsDisabled} />
+              {canWrite ? <StickySessionsSection disabled={controlsDisabled} /> : null}
               <DataRetentionSettings
                 key={[
                   settings.requestLogRetentionOverrideDays,
