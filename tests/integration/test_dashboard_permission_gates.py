@@ -93,7 +93,7 @@ async def test_security_settings_fields_require_security_write(
     _use_principal(app_instance, monkeypatch, _principal_without(Permission.SECURITY_WRITE))
     current = (await async_client.get("/api/settings")).json()
 
-    for field in ("totpRequiredOnLogin", "apiKeyAuthEnabled", "guestAccessEnabled"):
+    for field in ("totpRequiredOnLogin", "apiKeyAuthEnabled", "guestAccessEnabled", "hideUpstreamQuotaFromApiKeys"):
         response = await async_client.put("/api/settings", json={field: not current[field]})
         _assert_permission_required(response, Permission.SECURITY_WRITE)
     _assert_permission_required(
