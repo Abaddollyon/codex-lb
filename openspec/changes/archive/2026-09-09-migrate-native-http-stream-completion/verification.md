@@ -28,6 +28,29 @@ their previous owners. There is no throughput claim.
 - Built dashboard browser smoke: 5 passed.
 - `make lint`, full `uv run ty check`, and 64 strict OpenSpec specs passed.
 
+## Failure-path test evidence
+
+The following exact tests were repeated together with the release helper on
+`a365a1fd9f099a671af8db6da49e811760b1b120`: **21 passed** in 1.56 seconds.
+
+- `tests/unit/test_native_egress.py::test_interpreted_sse_rejects_invalid_metadata_without_replay`:
+  **15 passed**. The `events7` case ends an unfinished interpreted event before
+  its final fragment; `events9` through `events14` reject invalid completion
+  marker types, completion on an intermediate fragment, and completion on
+  nonterminal event types. Every case verifies a protocol error, removal of the
+  owned stream, and a single request sequence (no replay).
+- `tests/unit/test_native_egress.py::test_bounded_event_queue_trips_on_bytes_or_events_and_releases_bytes_on_get`:
+  **1 passed**. Both byte-budget and event-count overflow raise `QueueFull`;
+  draining releases bytes, including interpreted-event text and metadata.
+- `tests/unit/test_native_egress.py::test_client_close_does_not_hang_when_stream_queue_is_full`:
+  **1 passed**. A stalled consumer exceeds the shared adapter's per-request
+  byte budget, receives the bounded-queue transport error, and does not prevent
+  a healthy request on the same helper from completing or client cleanup.
+- `tests/integration/test_native_sse_egress.py::test_cancelling_native_stream_after_partial_event_keeps_peer_request_usable`:
+  **4 passed** (direct/routed, with/without an already-cancelled scope). The real
+  helper closes the cancelled upstream connection after a partial event while
+  its peer finishes on the same still-running helper process.
+
 ## Verification after updating to current main
 
 The PR branch was rebased onto `2a4303492f2c1fd209a7490cf1493c98b56ffde1`,
