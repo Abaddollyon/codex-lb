@@ -30,14 +30,18 @@ apart across consumers:
   the exact legacy behaviour with no kill switch.
 
 The conversation-presence primitives at the bottom follow the same
-partitioning rule but resolve it INSIDE one statement (the watermark joined
-into both UNION branches) instead of returning raw windows: distinct
-conversation counts must merge folded ids and raw-tail ids in a single
-snapshot, and the raw complement can be phrased watermark-relative as
-``requested_at < ceil_grid(since) OR requested_at >= least(W,
-floor_grid(until))`` — an exact complement of the folded buckets for any
-watermark position, degrading to the full window when the watermark is at
-the epoch (or the state row is missing, via the raw branch's OUTER join).
+partitioning rule but resolve it INSIDE one statement (the watermark read
+from the state row as a scalar subquery in both UNION branches) instead of
+returning raw windows: distinct conversation counts must merge folded ids
+and raw-tail ids in a single snapshot, and the raw complement is phrased as
+two constant ranges ``requested_at < ceil_grid(since) OR requested_at >=
+greatest(ceil_grid(since), least(W, floor_grid(until)))`` — an exact
+complement of the folded buckets for any watermark position that the
+planner serves from the ``requested_at`` index (the labeled reports
+variant emits the two ranges as separate UNION ALL arms, since an OR over
+join-parameterized bounds is not index-usable), degrading to the full
+window when the watermark is at the epoch or the state row is missing
+(``coalesce(W, ceil_grid(since))``).
 """
 
 from __future__ import annotations
@@ -348,25 +352,46 @@ def raw_windows_clause(windows: Sequence[RawWindow]) -> ColumnElement[bool]:
 #
 # Distinct conversation counts are not additive across the fold boundary, so
 # the conversation readers merge the folded ids and the raw-tail ids inside
-# ONE statement: the state row is joined into both UNION branches, giving the
-# whole read a single snapshot (a concurrent fold slice or an operator
-# escape-hatch reset can never split the watermark generation between the
-# folded segment and the raw complement). `request_count` rides along for the
-# additive conversation-request totals (each raw row contributes 1).
+# ONE statement. The watermark is read from the state row as an uncorrelated
+# scalar subquery in both UNION branches: the statement still has a single
+# snapshot (a concurrent fold slice or an operator escape-hatch reset can
+# never split the watermark generation between the folded segment and the
+# raw complement), while the planner evaluates the subquery once and can use
+# it as a constant bound on `requested_at` (PostgreSQL InitPlan parameter,
+# SQLite scalar subquery), so the raw branch is a bounded index range instead
+# of a per-row filter over a joined column. `request_count` rides along for
+# the additive conversation-request totals (each raw row contributes 1).
 
 
-def _conversation_watermark_epoch_expr(session: AsyncSession) -> ColumnElement:
+def _conversation_watermark_subquery() -> ColumnElement:
+    """The conversation watermark (naive-UTC), NULL when the state row is
+    missing, as a scalar subquery evaluated once per statement."""
+    return (
+        select(AccountUsageRollupState.conversation_folded_through)
+        .where(AccountUsageRollupState.id == _STATE_ROW_ID)
+        .scalar_subquery()
+    )
+
+
+def _conversation_watermark_epoch_subquery(session: AsyncSession) -> ColumnElement:
     """Epoch seconds of the conversation watermark (whole hours, so the
     conversion is exact), dialect-split like the bucket expressions."""
     column = AccountUsageRollupState.conversation_folded_through
     if session.get_bind().dialect.name == "postgresql":
-        return cast(func.floor(func.extract("epoch", column)), BigInteger)
-    return cast(func.strftime("%s", column), Integer)
+        epoch = cast(func.floor(func.extract("epoch", column)), BigInteger)
+    else:
+        epoch = cast(func.strftime("%s", column), Integer)
+    return select(epoch).where(AccountUsageRollupState.id == _STATE_ROW_ID).scalar_subquery()
 
 
 def _least_fn(session: AsyncSession):
     # SQLite's two-argument min() scalar function is its least().
     return func.least if session.get_bind().dialect.name == "postgresql" else func.min
+
+
+def _greatest_fn(session: AsyncSession):
+    # SQLite's two-argument max() scalar function is its greatest().
+    return func.greatest if session.get_bind().dialect.name == "postgresql" else func.max
 
 
 def _conversation_folded_select(
@@ -378,9 +403,11 @@ def _conversation_folded_select(
     display_bucket_seconds: int | None,
 ) -> Select:
     rollup = RequestConversationHourlyRollup
+    # `bucket_epoch < NULL` is never true, so a missing state row yields an
+    # empty folded segment (the raw branch then covers the whole window).
     conditions: list[ColumnElement[bool]] = [
         rollup.bucket_epoch >= epoch_seconds(ceil_to_grid(since, HOURLY_BUCKET_SECONDS)),
-        rollup.bucket_epoch < _conversation_watermark_epoch_expr(session),
+        rollup.bucket_epoch < _conversation_watermark_epoch_subquery(session),
     ]
     if until is not None:
         conditions.append(rollup.bucket_epoch < epoch_seconds(floor_to_grid(until, HOURLY_BUCKET_SECONDS)))
@@ -398,24 +425,41 @@ def _conversation_folded_select(
         else:
             display = cast(rollup.bucket_epoch / display_bucket_seconds, Integer) * display_bucket_seconds
         columns.insert(0, display.label("bucket_epoch"))
-    return (
-        select(*columns)
-        .select_from(AccountUsageRollupState)
-        .join(rollup, and_(*conditions))
-        .where(AccountUsageRollupState.id == _STATE_ROW_ID)
-    )
+    return select(*columns).where(and_(*conditions))
+
+
+def _conversation_tail_start(
+    session: AsyncSession, lo: datetime | ColumnElement, hi: datetime | ColumnElement | None
+) -> ColumnElement:
+    """Start of the un-folded raw tail, ``greatest(lo, least(coalesce(W, lo),
+    hi))``: the watermark clamped into the folded range ``[lo, hi)``.
+
+    ``W`` is the uncorrelated scalar subquery of the state row, so the whole
+    expression is a statement constant (PostgreSQL InitPlan parameter) or, for
+    the labeled union, a function of the window row it is joined to. A NULL
+    watermark (state row missing) coalesces to ``lo`` and an epoch watermark
+    clamps to ``lo``: either way the tail starts at ``lo`` and the raw
+    complement degrades to the caller's full window, exactly like the legacy
+    raw read.
+    """
+    watermark = func.coalesce(_conversation_watermark_subquery(), lo)
+    clamped = watermark if hi is None else _least_fn(session)(watermark, hi)
+    return _greatest_fn(session)(lo, clamped)
 
 
 def _conversation_raw_complement_clause(
     session: AsyncSession, lo: datetime, hi: datetime | None
 ) -> ColumnElement[bool]:
     """Rows NOT covered by the folded segment ``[lo, min(W, hi))``: below the
-    ceil-grid start, or at/above the watermark-clamped end. A NULL watermark
-    (state row missing — the callers OUTER-join it) or an epoch watermark
-    degrades to the caller's full window."""
-    watermark = AccountUsageRollupState.conversation_folded_through
-    tail_start = watermark if hi is None else _least_fn(session)(watermark, hi)
-    return or_(watermark.is_(None), RequestLog.requested_at < lo, RequestLog.requested_at >= tail_start)
+    ceil-grid start, or at/above the tail start.
+
+    Both bounds are statement constants (``lo``/``hi`` literals, ``W`` an
+    uncorrelated scalar subquery), so PostgreSQL plans the OR as a BitmapOr of
+    two index ranges on ``requested_at`` — never a per-row test of a joined
+    column. Only valid with constant bounds: an OR whose bounds come from a
+    joined row is applied as a filter (see ``conversation_labeled_presence_union``).
+    """
+    return or_(RequestLog.requested_at < lo, RequestLog.requested_at >= _conversation_tail_start(session, lo, hi))
 
 
 def _conversation_raw_select(
@@ -439,12 +483,7 @@ def _conversation_raw_select(
     columns: list = [conversation_id_expr().label("cid"), literal(1).label("request_count")]
     if display_bucket_seconds is not None:
         columns.insert(0, _requested_at_epoch_bucket_expr(session, display_bucket_seconds).label("bucket_epoch"))
-    return (
-        select(*columns)
-        .select_from(RequestLog)
-        .outerjoin(AccountUsageRollupState, AccountUsageRollupState.id == _STATE_ROW_ID)
-        .where(and_(*conditions))
-    )
+    return select(*columns).select_from(RequestLog).where(and_(*conditions))
 
 
 def conversation_presence_union(
@@ -506,38 +545,45 @@ def conversation_labeled_presence_union(
     windows_cte = (window_rows[0] if len(window_rows) == 1 else union_all(*window_rows)).cte("conversation_windows")
     rollup = RequestConversationHourlyRollup
     folded = select(windows_cte.c.label, rollup.conversation_id.label("cid")).select_from(
-        windows_cte.join(AccountUsageRollupState, AccountUsageRollupState.id == _STATE_ROW_ID).join(
+        windows_cte.join(
             rollup,
             and_(
                 rollup.bucket_epoch >= windows_cte.c.fold_lo_epoch,
                 rollup.bucket_epoch < windows_cte.c.fold_hi_epoch,
-                rollup.bucket_epoch < _conversation_watermark_epoch_expr(session),
+                rollup.bucket_epoch < _conversation_watermark_epoch_subquery(session),
             ),
         )
     )
-    watermark = AccountUsageRollupState.conversation_folded_through
-    raw = (
-        select(windows_cte.c.label, conversation_id_expr().label("cid"))
-        .select_from(
+
+    # The raw complement of each day window is two half-open ranges: the
+    # sub-hour leading edge `[window_start, min(window_end, fold_lo))` and the
+    # un-folded tail `[tail_start, window_end)`. PostgreSQL applies an OR over
+    # join-parameterized bounds as a per-row filter (no BitmapOr path exists
+    # for it, unlike the constant-bound OR of `conversation_presence_union`),
+    # so the two ranges are emitted as separate UNION ALL arms, each a plain
+    # parameterized index range on `requested_at`. The ranges are disjoint
+    # (`< fold_lo` vs `>= tail_start >= fold_lo`), so no row appears twice.
+    def _raw_arm(start: ColumnElement, end: ColumnElement) -> Select:
+        return select(windows_cte.c.label, conversation_id_expr().label("cid")).select_from(
             windows_cte.join(
                 RequestLog,
                 and_(
-                    RequestLog.requested_at >= windows_cte.c.window_start,
-                    RequestLog.requested_at < windows_cte.c.window_end,
+                    RequestLog.requested_at >= start,
+                    RequestLog.requested_at < end,
                     conversation_id_expr().is_not(None),
                     *raw_conditions,
                 ),
-            ).outerjoin(AccountUsageRollupState, AccountUsageRollupState.id == _STATE_ROW_ID)
-        )
-        .where(
-            or_(
-                watermark.is_(None),
-                RequestLog.requested_at < windows_cte.c.fold_lo_at,
-                RequestLog.requested_at >= _least_fn(session)(watermark, windows_cte.c.fold_hi_at),
             )
         )
+
+    leading_edge = _raw_arm(
+        windows_cte.c.window_start, _least_fn(session)(windows_cte.c.window_end, windows_cte.c.fold_lo_at)
     )
-    return union_all(folded, raw)
+    tail = _raw_arm(
+        _conversation_tail_start(session, windows_cte.c.fold_lo_at, windows_cte.c.fold_hi_at),
+        windows_cte.c.window_end,
+    )
+    return union_all(folded, leading_edge, tail)
 
 
 async def earliest_hourly_bucket_at(session: AsyncSession) -> datetime | None:
