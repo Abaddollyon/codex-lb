@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse
 from starlette.staticfiles import StaticFiles
 
 from app.core.audit.service import drain_audit_log_tasks
+from app.core.auth.dashboard_users_cache import get_dashboard_users_cache
 from app.core.auth.guardian import build_auth_guardian_scheduler
 from app.core.balancer import configure_replica_salt
 from app.core.bootstrap import ensure_auto_bootstrap_token, log_bootstrap_token
@@ -464,6 +465,7 @@ async def lifespan(app: FastAPI):
     startup_module._startup_complete = False
     startup_module.reset_bridge_registration()
     await get_settings_cache().invalidate(propagate=False)
+    await get_dashboard_users_cache().invalidate(propagate=False)
     await get_rate_limit_headers_cache().invalidate()
     reload_additional_quota_registry()
     settings = get_settings()
@@ -514,6 +516,7 @@ async def lifespan(app: FastAPI):
         NAMESPACE_ACCOUNT_ROUTING,
         NAMESPACE_ACCOUNT_SELECTION,
         NAMESPACE_API_KEY,
+        NAMESPACE_DASHBOARD_USERS,
         NAMESPACE_FIREWALL,
         NAMESPACE_MODEL_REGISTRY,
         NAMESPACE_RESET_CREDITS,
@@ -547,6 +550,10 @@ async def lifespan(app: FastAPI):
     cache_poller.on_invalidation(
         NAMESPACE_SETTINGS,
         lambda: get_settings_cache().invalidate(propagate=False),
+    )
+    cache_poller.on_invalidation(
+        NAMESPACE_DASHBOARD_USERS,
+        lambda: get_dashboard_users_cache().invalidate(propagate=False),
     )
     cache_poller.on_invalidation(NAMESPACE_UPSTREAM_ROUTE, get_upstream_route_cache().clear)
     # The route resolver also reads the dashboard settings row (routing enabled
