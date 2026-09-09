@@ -939,6 +939,7 @@ class LoadBalancer:
                     redact_sensitive_details=redact_sensitive_details,
                     api_key_id=api_key_id,
                     api_key_stream_fair_share_threshold_pct=api_key_stream_fair_share_threshold_pct,
+                    exclude_account_ids=frozenset(excluded_ids),
                     selection_inputs=selection_inputs,
                     reload_inputs=load_selection_inputs,
                     record_account_cap_rejection=_record_account_cap_rejection,
@@ -1649,6 +1650,7 @@ class LoadBalancer:
         allow_usage_exhaustion_error: bool = True,
         usage_exhaustion_states: Iterable[AccountState] | None = None,
         sticky_refresh_skip_deadline: datetime | None = None,
+        redact_sensitive_details: bool = False,
     ) -> _StickySelectionOutcome:
         return await _run_select_with_stickiness(
             states=states,
@@ -1676,6 +1678,7 @@ class LoadBalancer:
             sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
             overload_backoff_runtime=self._runtime,
             clock=self._clock,
+            redact_sensitive_details=redact_sensitive_details,
         )
 
     _persist_sticky_mutation = staticmethod(_persist_sticky_mutation)
