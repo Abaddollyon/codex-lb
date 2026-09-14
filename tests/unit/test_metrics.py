@@ -164,6 +164,18 @@ def test_prometheus_metrics_defined_when_dependency_available(monkeypatch: pytes
     )
 
 
+def test_update_accounts_total_publishes_each_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    prometheus_module, _ = _load_metrics_modules(monkeypatch, prometheus_client_module=_fake_prometheus_client_module())
+
+    accounts = [types.SimpleNamespace(status="active"), types.SimpleNamespace(status=types.SimpleNamespace(value="paused"))]
+    prometheus_module.update_accounts_total(accounts)
+
+    samples = prometheus_module.accounts_total.samples
+    assert samples[(("status", "active"),)].value == 1
+    assert samples[(("status", "paused"),)].value == 1
+    assert samples[(("status", "deactivated"),)].value == 0
+
+
 def test_cap_partition_replicas_gauge_uses_livemax_in_multiprocess_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:

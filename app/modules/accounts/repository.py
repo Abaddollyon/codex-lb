@@ -17,6 +17,7 @@ from app.core.auth import extract_id_token_claims, resolve_seat_identity
 from app.core.crypto import TokenEncryptor
 from app.core.upstream_proxy.cache import get_upstream_route_cache
 from app.core.utils.time import utcnow
+from app.core.metrics.prometheus import update_accounts_total
 from app.db.account_identity_lock import advisory_lock_key, lock_postgresql_account_identities
 from app.db.models import (
     Account,
@@ -225,7 +226,9 @@ class AccountsRepository:
         if refresh_existing:
             stmt = stmt.execution_options(populate_existing=True)
         result = await self._session.execute(stmt)
-        return list(result.scalars().all())
+        accounts = list(result.scalars().all())
+        update_accounts_total(accounts)
+        return accounts
 
     async def list_accounts_by_ids(self, account_ids: list[str], *, refresh_existing: bool = False) -> list[Account]:
         if not account_ids:

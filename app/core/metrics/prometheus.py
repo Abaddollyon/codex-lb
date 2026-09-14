@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 import os
 from importlib import import_module
 from typing import Protocol
@@ -34,6 +35,21 @@ except ImportError:
 
 PROMETHEUS_AVAILABLE = prometheus_client is not None
 MULTIPROCESS_MODE = bool(os.environ.get("PROMETHEUS_MULTIPROC_DIR"))
+
+_ACCOUNT_STATUS_VALUES = ("active", "rate_limited", "quota_exceeded", "paused", "reauth_required", "deactivated")
+
+
+def update_accounts_total(accounts: Iterable[object]) -> None:
+    """Publish the current account counts, including zeroes for stale statuses."""
+    if not PROMETHEUS_AVAILABLE or accounts_total is None:
+        return
+    counts = {status: 0 for status in _ACCOUNT_STATUS_VALUES}
+    for account in accounts:
+        status = getattr(getattr(account, "status", None), "value", getattr(account, "status", None))
+        if status in counts:
+            counts[status] += 1
+    for status, count in counts.items():
+        accounts_total.labels(status=status).set(count)
 
 
 if PROMETHEUS_AVAILABLE:
@@ -541,6 +557,7 @@ __all__ = [
     "account_lease_released_total",
     "account_lease_stale_reclaimed_total",
     "accounts_total",
+    "update_accounts_total",
     "api_key_fair_share_rejections_total",
     "bridge_instance_mismatch_total",
     "bridge_forward_latency_seconds",
