@@ -1035,10 +1035,10 @@ class _HTTPBridgeStreamingMixin:
             )
             else None
         )
-        if runtime_config.enabled and (image_request or image_generation_request):
+        if runtime_config.enabled and image_generation_request:
             record_http_bridge_routing(stage="bypass", reason="image")
             logger.info(
-                "stream_responses bypassing http bridge for image-capable request input_image=%s "
+                "stream_responses bypassing http bridge for image-generation request input_image=%s "
                 "image_generation=%s request_id=%s",
                 image_request,
                 image_generation_request,

@@ -4775,7 +4775,7 @@ async def test_core_inline_input_image_urls_converts_top_level_input_image(monke
 
 
 @pytest.mark.asyncio
-async def test_stream_http_bridge_or_retry_bypasses_bridge_for_input_image(monkeypatch):
+async def test_stream_http_bridge_or_retry_uses_bridge_for_input_image(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     settings = _make_proxy_settings()
@@ -4862,8 +4862,8 @@ async def test_stream_http_bridge_or_retry_bypasses_bridge_for_input_image(monke
         )
     ]
 
-    assert output == ["data: retry\n\n"]
-    assert calls == [("retry", payload, None, 180.0, None)]
+    assert output == ["data: bridge\n\n"]
+    assert calls == [("bridge", None, None, None, None)]
 
     text_payload = ResponsesRequest.model_validate(
         {
