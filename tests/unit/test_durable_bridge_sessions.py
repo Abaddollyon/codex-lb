@@ -129,7 +129,6 @@ async def test_durable_bridge_lookup_prefers_turn_state_then_previous_response_t
     )
     assert by_previous is not None
     assert by_previous.canonical_key == "sid-123"
-
     by_session = await coordinator.lookup_request_targets(
         session_key_kind="request",
         session_key_value="req-1",
@@ -140,6 +139,102 @@ async def test_durable_bridge_lookup_prefers_turn_state_then_previous_response_t
     )
     assert by_session is not None
     assert by_session.canonical_key == "sid-123"
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_poison_retirement_tombstones_bridge_and_sticky_owner(
+    async_session_factory: Callable[[], AsyncSession],
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="prompt_cache",
+        session_key_value="poison-cache-key",
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=120.0,
+        account_id="acc-poisoned",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id="resp-poisoned",
+        allow_takeover=True,
+    )
+    async with async_session_factory() as session:
+        session.add(
+            StickySession(
+                key="poison-cache-key",
+                kind=StickySessionKind.PROMPT_CACHE,
+                account_id="acc-poisoned",
+            )
+        )
+        await session.commit()
+
+    retired = await coordinator.retire_prompt_cache_owner_if_matches(
+        session_id=claimed.session_id,
+        session_key_value="poison-cache-key",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        expected_account_id="acc-poisoned",
+        expected_latest_response_id="resp-poisoned",
+        expected_latest_turn_state=None,
+    )
+
+    assert retired is True
+    lookup = await coordinator.lookup_request_targets(
+        session_key_kind="prompt_cache",
+        session_key_value="poison-cache-key",
+        api_key_id="key-1",
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+    )
+    assert lookup is not None
+    assert lookup.continuity_abandoned is True
+    assert lookup.account_id is None
+    assert lookup.latest_response_id is None
+
+    async with async_session_factory() as session:
+        sticky = await session.scalar(
+            select(StickySession).where(
+                StickySession.key == "poison-cache-key",
+                StickySession.kind == StickySessionKind.PROMPT_CACHE,
+            )
+        )
+    assert sticky is not None
+    assert sticky.continuity_abandoned_at is not None
+    assert sticky.account_id == "acc-poisoned"
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_poison_retirement_loses_to_a_fresh_anchor(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="prompt_cache",
+        session_key_value="poison-cache-race",
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=120.0,
+        account_id="acc-poisoned",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id="resp-fresh",
+        allow_takeover=True,
+    )
+    retired = await coordinator.retire_prompt_cache_owner_if_matches(
+        session_id=claimed.session_id,
+        session_key_value="poison-cache-race",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        expected_account_id="acc-poisoned",
+        expected_latest_response_id="resp-poisoned",
+        expected_latest_turn_state=None,
+    )
+
+    assert retired is False
 
 
 @pytest.mark.asyncio

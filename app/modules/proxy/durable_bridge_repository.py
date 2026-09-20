@@ -33,6 +33,8 @@ from app.db.models import (
     HttpBridgeSessionAlias,
     HttpBridgeSessionRecord,
     HttpBridgeSessionState,
+    StickySession,
+    StickySessionKind,
 )
 from app.db.session import sqlite_writer_section
 from app.modules.proxy.account_eligibility import HARD_OWNER_UNAVAILABLE_STATUSES
@@ -1400,6 +1402,119 @@ class DurableBridgeRepository:
                 await self._clear_aliases_for_session(session_id)
             await self._session.commit()
         return bool(getattr(result, "rowcount", 0))
+
+    async def retire_prompt_cache_owner_if_matches(
+        self,
+        session_id: str,
+        *,
+        session_key_value: str,
+        instance_id: str,
+        owner_epoch: int,
+        expected_account_id: str,
+        expected_latest_response_id: str | None,
+        expected_latest_turn_state: str | None,
+    ) -> bool:
+        """Tombstone a poisoned prompt-cache owner under one transaction.
+
+        The bridge row is the authority and fences the write on the worker
+        lease, account, and both continuity columns captured by the poison
+        consult. The matching soft sticky row is tombstoned in the same
+        transaction when it still names that account, so a later request
+        cannot immediately re-pin the poisoned lineage.
+        """
+        if not session_id or not session_key_value or not expected_account_id:
+            return False
+        conditions = [
+            HttpBridgeSessionRecord.id == session_id,
+            HttpBridgeSessionRecord.session_key_kind == "prompt_cache",
+            HttpBridgeSessionRecord.session_key_value == session_key_value,
+            HttpBridgeSessionRecord.owner_instance_id == instance_id,
+            HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+            HttpBridgeSessionRecord.account_id == expected_account_id,
+            HttpBridgeSessionRecord.continuity_abandoned_at.is_(None),
+            HttpBridgeSessionRecord.continuity_abandonment_scope.is_(None),
+        ]
+        if expected_latest_response_id is None:
+            conditions.append(HttpBridgeSessionRecord.latest_response_id.is_(None))
+        else:
+            conditions.append(HttpBridgeSessionRecord.latest_response_id == expected_latest_response_id)
+        if expected_latest_turn_state is None:
+            conditions.append(HttpBridgeSessionRecord.latest_turn_state.is_(None))
+        else:
+            conditions.append(HttpBridgeSessionRecord.latest_turn_state == expected_latest_turn_state)
+        now = utcnow()
+        values = {
+            "continuity_abandoned_at": now,
+            "continuity_abandonment_scope": _REQUEST_PATH_ABANDONMENT_SCOPE,
+            "latest_turn_state": None,
+            "latest_response_id": None,
+            "latest_input_item_count": None,
+            "latest_input_full_fingerprint": None,
+            "latest_pending_tool_calls_json": None,
+            "owner_instance_id": None,
+            "lease_expires_at": now,
+            "state": HttpBridgeSessionState.CLOSED,
+            "closed_at": now,
+            "last_seen_at": now,
+        }
+        async with sqlite_writer_section():
+            bridge_result = await self._session.execute(
+                update(HttpBridgeSessionRecord).where(*conditions).values(**values)
+            )
+            if not bool(getattr(bridge_result, "rowcount", 0)):
+                await self._session.rollback()
+                return False
+            sticky = await self._session.scalar(
+                select(StickySession).where(
+                    StickySession.key == session_key_value,
+                    StickySession.kind == StickySessionKind.PROMPT_CACHE,
+                )
+            )
+            if sticky is not None:
+                if (
+                    sticky.account_id != expected_account_id
+                    or sticky.continuity_abandoned_at is not None
+                    or sticky.continuity_abandonment_scope is not None
+                ):
+                    await self._session.rollback()
+                    return False
+                sticky_result = await self._session.execute(
+                    update(StickySession)
+                    .where(
+                        StickySession.key == session_key_value,
+                        StickySession.kind == StickySessionKind.PROMPT_CACHE,
+                        StickySession.account_id == expected_account_id,
+                        StickySession.continuity_abandoned_at.is_(None),
+                        StickySession.continuity_abandonment_scope.is_(None),
+                    )
+                    .values(
+                        updated_at=now,
+                        continuity_abandoned_at=now,
+                        continuity_abandonment_scope=None,
+                    )
+                )
+                if not bool(getattr(sticky_result, "rowcount", 0)):
+                    await self._session.rollback()
+                    return False
+            else:
+                # Preserve exclusion evidence even for a legacy/orphan bridge
+                # row whose soft sticky record was removed before retirement.
+                # The selector consumes this timestamped prompt-cache row and
+                # will not immediately choose the poisoned account again.
+                self._session.add(
+                    StickySession(
+                        key=session_key_value,
+                        kind=StickySessionKind.PROMPT_CACHE,
+                        account_id=expected_account_id,
+                        created_at=now,
+                        updated_at=now,
+                        continuity_abandoned_at=now,
+                        continuity_abandonment_scope=None,
+                    )
+                )
+            await self._clear_aliases_for_session(session_id)
+            await self._session.commit()
+        return True
 
     async def release_session(
         self,

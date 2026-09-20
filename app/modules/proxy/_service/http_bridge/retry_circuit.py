@@ -90,6 +90,12 @@ _HTTP_BRIDGE_RETRY_CIRCUIT_ANCHOR_SUPERSEDED_DETAIL = "anchor_superseded"
 _HTTP_BRIDGE_RETRY_CIRCUIT_ANCHOR_ABANDONED_DETAIL = "anchor_abandoned"
 
 
+def _http_bridge_retry_circuit_supported_key(key: _HTTPBridgeSessionKey) -> bool:
+    """Return whether this affinity lane has durable poison recovery."""
+
+    return key.strength == "hard" or key.affinity_kind == "prompt_cache"
+
+
 def _http_bridge_anchor_poison_detail(detail: str | None) -> str | None:
     """Map an eventless retry-circuit failure class to its anchor-poison detail.
 
@@ -384,7 +390,7 @@ class _HTTPBridgeRetryCircuitMixin:
         cached below-threshold or reset row cannot hide a remote opening
         from the anchor decision.
         """
-        if key.strength != "hard":
+        if not _http_bridge_retry_circuit_supported_key(key):
             return
         async with self._http_bridge_retry_circuit_lock:
             if key in self._http_bridge_retry_circuit_loaded_keys:
@@ -540,7 +546,7 @@ class _HTTPBridgeRetryCircuitMixin:
 
     async def _load_http_bridge_retry_circuit(self: Any, session: _HTTPBridgeSession) -> bool:
         key = session.key
-        if key.strength != "hard":
+        if not _http_bridge_retry_circuit_supported_key(key):
             return True
 
         now_monotonic = clock_for(self).monotonic()
@@ -1106,7 +1112,7 @@ class _HTTPBridgeRetryCircuitMixin:
         claimed_lease_out: list[float] | None = None,
     ) -> bool:
         """Avoid replaying a repeatedly failing hard-affinity request in a tight loop."""
-        if session.key.strength != "hard":
+        if not _http_bridge_retry_circuit_supported_key(session.key):
             return True
 
         await self._load_http_bridge_retry_circuit(session)
@@ -1370,7 +1376,7 @@ class _HTTPBridgeRetryCircuitMixin:
         retry-after of ~1s while the caller is barred for the rest of the
         lease, which turns a wedged key into a client retry storm.
         """
-        if session.key.strength != "hard":
+        if not _http_bridge_retry_circuit_supported_key(session.key):
             return 0.0, "none"
 
         await self._load_http_bridge_retry_circuit(session)
@@ -1414,7 +1420,7 @@ class _HTTPBridgeRetryCircuitMixin:
         — the upper bound of the timer actually refusing the caller — rather
         than a fabricated ~1s.
         """
-        if key.strength != "hard":
+        if not _http_bridge_retry_circuit_supported_key(key):
             return 0.0, "none"
         now = clock_for(self).monotonic()
         async with self._http_bridge_retry_circuit_lock:
@@ -1438,7 +1444,7 @@ class _HTTPBridgeRetryCircuitMixin:
         return cooldown_remaining, "hard_key_cooldown"
 
     async def _http_bridge_precreated_retry_cooldown_seconds(self: Any, session: _HTTPBridgeSession) -> float:
-        if session.key.strength != "hard":
+        if not _http_bridge_retry_circuit_supported_key(session.key):
             return 0.0
 
         await self._load_http_bridge_retry_circuit(session)
@@ -1482,7 +1488,10 @@ class _HTTPBridgeRetryCircuitMixin:
         never asserts it, so its "upstream answered" guard is unchanged.
         """
         detail = _HTTP_BRIDGE_RETRY_CIRCUIT_DETAIL_ALIASES.get(detail, detail)
-        if session.key.strength != "hard" or detail not in _HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_DETAILS:
+        if (
+            not _http_bridge_retry_circuit_supported_key(session.key)
+            or detail not in _HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_DETAILS
+        ):
             return None
 
         scoped_attempt = attempt
@@ -2156,7 +2165,7 @@ class _HTTPBridgeRetryCircuitMixin:
         its durable write lands and deletes exactly the row it created.
         """
         key = session.key
-        if key.strength != "hard":
+        if not _http_bridge_retry_circuit_supported_key(key):
             return True
         key_lock = await self._acquire_http_bridge_retry_circuit_key_lock(key)
         try:

@@ -490,6 +490,29 @@ class DurableBridgeSessionCoordinator:
                 expected_latest_turn_state=expected_latest_turn_state,
             )
 
+    async def retire_prompt_cache_owner_if_matches(
+        self,
+        *,
+        session_id: str,
+        session_key_value: str,
+        instance_id: str,
+        owner_epoch: int,
+        expected_account_id: str,
+        expected_latest_response_id: str | None,
+        expected_latest_turn_state: str | None,
+    ) -> bool:
+        """Atomically abandon a repeatedly poisoned soft prompt-cache owner."""
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).retire_prompt_cache_owner_if_matches(
+                session_id,
+                session_key_value=session_key_value,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                expected_account_id=expected_account_id,
+                expected_latest_response_id=expected_latest_response_id,
+                expected_latest_turn_state=expected_latest_turn_state,
+            )
+
     async def session_latest_continuity(self, *, session_id: str) -> tuple[str | None, str | None] | None:
         """Read the session's current continuity anchors for a fenced clear."""
         async with self._session() as session:
