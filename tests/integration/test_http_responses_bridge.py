@@ -71,6 +71,160 @@ pytestmark = pytest.mark.integration
 _TEST_SYNC_TIMEOUT_SECONDS = 5.0
 
 
+@pytest.mark.asyncio
+async def test_v1_responses_prompt_cache_poison_retires_owner_and_preserves_cache_key(
+    async_client, app_instance, monkeypatch
+):
+    """Real routing and SQLite persistence must recover a repeatedly silent owner."""
+    _install_bridge_settings_with_limits(monkeypatch, enabled=True, instance_id=socket.gethostname())
+    owner_id = await _import_account(async_client, "acc_cache_poison_owner", "cache-poison-owner@example.com")
+    replacement_id = await _import_account(
+        async_client, "acc_cache_poison_replacement", "cache-poison-replacement@example.com"
+    )
+    owner = await _get_account(owner_id)
+    replacement = await _get_account(replacement_id)
+    cache_key = "prompt-cache-poison-recovery"
+    async with SessionLocal() as db:
+        await StickySessionsRepository(db).upsert(cache_key, owner_id, kind=proxy_module.StickySessionKind.PROMPT_CACHE)
+
+    fail_owner = False
+
+    class OwnerUpstream(_FakeBridgeUpstreamWebSocket):
+        async def send_text(self, text: str) -> None:
+            if not fail_owner:
+                await super().send_text(text)
+                return
+            self.sent_text.append(text)
+            await self._messages.put(_FakeUpstreamMessage("error", error="Upstream websocket receive failed"))
+
+    owner_upstreams: list[OwnerUpstream] = []
+    replacement_upstream = _FakeBridgeUpstreamWebSocket("resp_cache_replacement")
+    connected_accounts: list[str] = []
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        return target
+
+    async def fake_connect(headers, access_token, account_id_header, *, base_url=None, session=None):
+        connected_accounts.append(account_id_header)
+        if account_id_header == owner.chatgpt_account_id:
+            upstream = OwnerUpstream("resp_cache_owner")
+            owner_upstreams.append(upstream)
+            return upstream
+        assert account_id_header == replacement.chatgpt_account_id
+        return replacement_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect)
+    service = get_proxy_service_for_app(app_instance)
+    retirement_finished = asyncio.Event()
+    retirement_results: list[bool] = []
+    original_retire = service._durable_bridge.retire_prompt_cache_owner_if_matches
+
+    async def observe_retirement(**kwargs):
+        result = await original_retire(**kwargs)
+        retirement_results.append(result)
+        retirement_finished.set()
+        return result
+
+    monkeypatch.setattr(service._durable_bridge, "retire_prompt_cache_owner_if_matches", observe_retirement)
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "Return exactly OK.",
+        "input": "hello",
+        "prompt_cache_key": cache_key,
+    }
+
+    # Healthy turns retain both account affinity and the upstream connection.
+    for _ in range(2):
+        response = await asyncio.wait_for(
+            async_client.post("/v1/responses", json=payload), timeout=_TEST_SYNC_TIMEOUT_SECONDS
+        )
+        assert response.status_code == 200, response.text
+    assert connected_accounts == [owner.chatgpt_account_id]
+    async with SessionLocal() as db:
+        healthy_bridge = (
+            await db.execute(
+                select(HttpBridgeSessionRecord).where(HttpBridgeSessionRecord.session_key_value == cache_key)
+            )
+        ).scalar_one()
+        assert healthy_bridge.account_id == owner_id
+        assert healthy_bridge.latest_response_id == "resp_cache_owner_2"
+        assert healthy_bridge.continuity_abandoned_at is None
+
+    fail_owner = True
+    # Independent continuation attempts against the same durable anchor each
+    # fail before response.created. An explicit anchor prevents safe fresh-turn
+    # replay from hiding the failure, and distinct inputs avoid operation dedup.
+    for attempt in range(2):
+        response = await asyncio.wait_for(
+            async_client.post(
+                "/v1/responses",
+                json={**payload, "input": f"follow-up {attempt}", "previous_response_id": "resp_cache_owner_2"},
+            ),
+            timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+        )
+        assert response.status_code == 502, response.text
+        assert response.json()["error"]["code"] == "stream_incomplete"
+
+    await _wait_for_event(retirement_finished)
+    assert retirement_results == [True]
+    async with SessionLocal() as db:
+        retired_bridge = (
+            await db.execute(
+                select(HttpBridgeSessionRecord).where(HttpBridgeSessionRecord.session_key_value == cache_key)
+            )
+        ).scalar_one()
+        retired_sticky = (
+            await db.execute(
+                select(StickySession).where(
+                    StickySession.key == cache_key, StickySession.kind == proxy_module.StickySessionKind.PROMPT_CACHE
+                )
+            )
+        ).scalar_one()
+        assert retired_bridge.account_id == owner_id
+        assert retired_bridge.continuity_abandonment_scope == "request_path"
+        assert retired_bridge.latest_response_id is None
+        assert retired_bridge.latest_turn_state is None
+        assert retired_sticky.account_id == owner_id
+        assert retired_sticky.continuity_abandoned_at is not None
+
+    full_history = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "OK"},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "OK"},
+        {"role": "user", "content": "continue with full history"},
+    ]
+    recovered = await asyncio.wait_for(
+        async_client.post("/v1/responses", json={**payload, "input": full_history}),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["id"] == "resp_cache_replacement_1"
+    assert connected_accounts == [
+        owner.chatgpt_account_id,
+        owner.chatgpt_account_id,
+        replacement.chatgpt_account_id,
+    ]
+    assert len(replacement_upstream.sent_text) == 1
+    recovered_payload = json.loads(replacement_upstream.sent_text[0])
+    assert recovered_payload["prompt_cache_key"] == cache_key
+    assert "previous_response_id" not in recovered_payload
+    assert all(
+        json.loads(text)["prompt_cache_key"] == cache_key for upstream in owner_upstreams for text in upstream.sent_text
+    )
+    async with SessionLocal() as db:
+        replacement_sticky = (
+            await db.execute(
+                select(StickySession).where(
+                    StickySession.key == cache_key, StickySession.kind == proxy_module.StickySessionKind.PROMPT_CACHE
+                )
+            )
+        ).scalar_one()
+        assert replacement_sticky.account_id == replacement_id
+        assert replacement_sticky.continuity_abandoned_at is None
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _cleanup_http_bridge_sessions(app_instance):
     yield

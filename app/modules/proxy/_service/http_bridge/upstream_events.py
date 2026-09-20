@@ -1277,10 +1277,11 @@ async def _abandon_durable_http_bridge_continuity(
 ) -> bool:
     """Clear durable continuity before retiring a repeatedly poisoned bridge.
 
-    ``rebind_session_account(clear_continuity=True)`` is an existing fenced
-    write that clears the durable response/turn anchor and its alias rows while
-    this worker still owns the session. The ordinary retirement path then
-    closes the row and removes the process-local registrations.
+    Hard continuity lanes use the existing fenced
+    ``rebind_session_account(clear_continuity=True)`` write. A poisoned
+    ``prompt_cache`` lane additionally tombstones its durable bridge and soft
+    sticky owner in one transaction, so the next request cannot re-pin the
+    same account after the local session is retired.
     """
     if session.durable_session_id is None or session.durable_owner_epoch is None:
         return False
@@ -1319,15 +1320,36 @@ async def _abandon_durable_http_bridge_continuity(
         rebind_fence_kwargs["expected_latest_response_id"] = expected_response_id
         rebind_fence_kwargs["expected_latest_turn_state"] = expected_turn_state
     try:
-        cleared = await service._durable_bridge.rebind_session_account(
-            session_id=session.durable_session_id,
-            api_key_id=session.key.api_key_id,
-            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
-            owner_epoch=session.durable_owner_epoch,
-            account_id=session.account.id,
-            clear_continuity=True,
-            **rebind_fence_kwargs,
+        retire_prompt_cache_owner = getattr(
+            service._durable_bridge,
+            "retire_prompt_cache_owner_if_matches",
+            None,
         )
+        if (
+            session.key.affinity_kind == "prompt_cache"
+            and expected_continuity is not _POISON_ANCHOR_CAPTURE_UNAVAILABLE
+            and callable(retire_prompt_cache_owner)
+        ):
+            expected_response_id, expected_turn_state = cast("tuple[str | None, str | None]", expected_continuity)
+            cleared = await retire_prompt_cache_owner(
+                session_id=session.durable_session_id,
+                session_key_value=session.key.affinity_key,
+                instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                owner_epoch=session.durable_owner_epoch,
+                expected_account_id=session.account.id,
+                expected_latest_response_id=expected_response_id,
+                expected_latest_turn_state=expected_turn_state,
+            )
+        else:
+            cleared = await service._durable_bridge.rebind_session_account(
+                session_id=session.durable_session_id,
+                api_key_id=session.key.api_key_id,
+                instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                owner_epoch=session.durable_owner_epoch,
+                account_id=session.account.id,
+                clear_continuity=True,
+                **rebind_fence_kwargs,
+            )
     except Exception:
         logger.warning("Failed to abandon poisoned HTTP bridge continuity", exc_info=True)
         return False

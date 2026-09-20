@@ -972,6 +972,25 @@ def _make_bridge_session(
     )
 
 
+@pytest.mark.asyncio
+async def test_prompt_cache_eventless_failures_open_retry_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    monkeypatch.setattr(http_bridge_retry_circuit_module, "_HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_THRESHOLD", 2)
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(return_value=None),
+        persist_retry_circuit=AsyncMock(return_value=None),
+    )
+    session = _make_bridge_session(
+        key=proxy_service._HTTPBridgeSessionKey("prompt_cache", "poison-cache", None),
+    )
+
+    assert await service._record_http_bridge_retry_circuit_failure(session, detail="stream_incomplete") == 1
+    assert await service._record_http_bridge_retry_circuit_failure(session, detail="stream_incomplete") == 2
+    assert session.key in cast(Any, service)._http_bridge_retry_circuits
+
+
 def test_http_bridge_account_neutral_replay_rejects_namespaced_tool_call_history() -> None:
     payload = proxy_service.ResponsesRequest.model_validate(
         {
@@ -33816,7 +33835,7 @@ async def test_http_bridge_submit_owns_admission_from_entry_and_releases_on_pre_
 
 
 @pytest.mark.asyncio
-async def test_http_bridge_retry_circuit_ignores_soft_affinity_and_other_failures(
+async def test_http_bridge_retry_circuit_supports_prompt_cache_and_ignores_other_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
@@ -33825,11 +33844,15 @@ async def test_http_bridge_retry_circuit_ignores_soft_affinity_and_other_failure
         "_HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_THRESHOLD",
         1,
     )
+    service._durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(return_value=None),
+        persist_retry_circuit=AsyncMock(return_value=None),
+    )
     soft_key = proxy_service._HTTPBridgeSessionKey("prompt_cache", "bridge-circuit-soft", None)
     soft_session = _make_bridge_session(key=soft_key)
 
     await service._record_http_bridge_retry_circuit_failure(soft_session, detail="stream_incomplete")
-    assert await service._http_bridge_precreated_retry_allowed(soft_session) is True
+    assert await service._http_bridge_precreated_retry_allowed(soft_session) is False
 
     hard_session = _make_bridge_session(key_value="bridge-circuit-other-error")
     await service._record_http_bridge_retry_circuit_failure(hard_session, detail="proxy_network_unavailable")

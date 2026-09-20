@@ -102,7 +102,15 @@ def _source_scoped_abandoned_account_id(
     account_id: str,
     abandonment_scope: str | None,
     continuity_source: _ContinuitySource | None,
+    *,
+    kind: StickySessionKind,
 ) -> str | None:
+    # Prompt-cache poison retirement uses the global timestamp form because
+    # the key is already a distinct soft namespace. Keep the retired account
+    # as exclusion evidence so a fresh selection cannot immediately choose
+    # the same upstream lineage after the tombstone is observed.
+    if abandonment_scope is None and kind == StickySessionKind.PROMPT_CACHE:
+        return account_id
     if abandonment_scope is not None and abandonment_scope == continuity_source:
         return account_id
     return None
@@ -111,6 +119,7 @@ def _source_scoped_abandoned_account_id(
 def _owner_lookup_from_row(
     row: StickySession,
     *,
+    kind: StickySessionKind,
     continuity_source: _ContinuitySource | None,
     refresh_skip_deadline: datetime | None = None,
 ) -> StickyOwnerLookup:
@@ -126,6 +135,7 @@ def _owner_lookup_from_row(
                 row.account_id,
                 row.continuity_abandonment_scope,
                 continuity_source,
+                kind=kind,
             ),
         )
     return StickyOwnerLookup(
@@ -204,13 +214,14 @@ class StickySessionsRepository:
         if row is None:
             return StickyOwnerLookup(account_id=None, continuity_abandoned=False)
         if max_age_seconds is None:
-            return _owner_lookup_from_row(row, continuity_source=continuity_source)
+            return _owner_lookup_from_row(row, kind=kind, continuity_source=continuity_source)
         now = utcnow()
         cutoff = now - timedelta(seconds=max_age_seconds)
         observed_updated_at = to_utc_naive(row.updated_at)
         if observed_updated_at >= cutoff:
             return _owner_lookup_from_row(
                 row,
+                kind=kind,
                 continuity_source=continuity_source,
                 refresh_skip_deadline=_same_owner_refresh_skip_deadline(
                     row,
@@ -280,6 +291,7 @@ class StickySessionsRepository:
                     current_account_id,
                     current_continuity_abandonment_scope,
                     continuity_source,
+                    kind=kind,
                 ),
             )
         return StickyOwnerLookup(account_id=current_account_id, continuity_abandoned=False)
