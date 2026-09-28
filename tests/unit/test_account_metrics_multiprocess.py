@@ -37,9 +37,11 @@ print(json.dumps([
 
 
 def test_multiprocess_account_inventory_uses_newest_live_snapshot(tmp_path: Path) -> None:
+    """Select the latest live pool snapshot, including zeroes and worker removal."""
     env = {**os.environ, "PROMETHEUS_MULTIPROC_DIR": str(tmp_path)}
 
     def run(script: str, *args: str) -> str:
+        """Run a fresh interpreter sharing the test's multiprocess metric files."""
         return subprocess.run(
             [sys.executable, "-c", script, *args],
             env=env,
@@ -53,6 +55,7 @@ def test_multiprocess_account_inventory_uses_newest_live_snapshot(tmp_path: Path
     second_pid = run(_WORKER, "2").strip()
 
     def assert_scrape(value: int, *args: str) -> None:
+        """Check one pool snapshot with every status and no worker PID labels."""
         samples = json.loads(run(_SCRAPE, *args))
         assert len(samples) == 7
         for name, labels, actual in samples:

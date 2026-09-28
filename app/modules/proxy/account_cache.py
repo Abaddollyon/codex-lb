@@ -121,6 +121,7 @@ class RoutingAvailabilityCache:
     """
 
     def __init__(self, session_factory: Callable[[], AsyncSession] | None = None, *, clock: Clock = REAL_CLOCK) -> None:
+        """Keep a routing snapshot with serialized refreshes and an expiry clock."""
         self._session_factory = session_factory
         self._clock = clock
         self._snapshot: dict[str, AccountStatus] | None = None
@@ -151,6 +152,7 @@ class RoutingAvailabilityCache:
         return status is None or status in _ROUTING_UNAVAILABLE_STATUSES
 
     async def refresh_from_db(self) -> None:
+        """Publish cache and metric observations in database-read order."""
         # Scrapes and invalidations can overlap. Serialize their reads and
         # publication so a slower old read cannot overwrite a newer snapshot.
         async with self._refresh_lock:

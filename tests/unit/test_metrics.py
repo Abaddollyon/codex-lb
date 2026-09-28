@@ -104,6 +104,7 @@ def reset_metrics_modules() -> Iterator[None]:
 def _load_metrics_modules(
     monkeypatch: pytest.MonkeyPatch, *, prometheus_client_module: types.ModuleType | None
 ) -> tuple[types.ModuleType, types.ModuleType]:
+    """Reload metrics against a fake client or a guaranteed missing dependency."""
     for name in ("app.core.metrics.prometheus", "app.core.metrics.middleware"):
         sys.modules.pop(name, None)
 
@@ -190,6 +191,7 @@ def test_cap_partition_replicas_gauge_has_no_multiprocess_mode_in_single_process
 def test_account_pool_gauges_use_latest_snapshot_without_worker_duplication(
     monkeypatch: pytest.MonkeyPatch, tmp_path, multiprocess: bool
 ) -> None:
+    """Use whole-pool gauge aggregation without adding process labels."""
     if multiprocess:
         monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
     else:
@@ -202,6 +204,7 @@ def test_account_pool_gauges_use_latest_snapshot_without_worker_duplication(
 
 
 def test_account_pool_gauges_are_optional(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leave account gauges disabled when the optional client cannot be imported."""
     module, _ = _load_metrics_modules(monkeypatch, prometheus_client_module=None)
     assert module.accounts_total is None
     assert module.accounts_available is None
