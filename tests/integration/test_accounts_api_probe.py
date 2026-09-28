@@ -98,12 +98,14 @@ async def test_force_probe_settles_after_repository_session_closes(
         plan_type=plan_type,
     )
     now = utcnow()
+    # Free accounts must ignore even exhausted legacy primary-window usage.
+    primary_used_percent = 100.0 if plan_type == "free" else 10.0
     async with SessionLocal() as session:
         session.add_all(
             UsageHistory(
                 account_id=account_id,
                 window=window,
-                used_percent=10.0,
+                used_percent=primary_used_percent if window == "primary" else 10.0,
                 recorded_at=now,
                 reset_at=int(now.timestamp()) + 3600,
                 window_minutes={"primary": 300, "secondary": 10080, "monthly": 43200}[window],
@@ -121,7 +123,7 @@ async def test_force_probe_settles_after_repository_session_closes(
         body = response.json()
         assert body["probeStatusCode"] == 200
         assert body["accountStatusAfter"] == "active"
-        assert body["primaryUsedPercentAfter"] == (10.0 if "primary" in windows else None)
+        assert body["primaryUsedPercentAfter"] == (primary_used_percent if "primary" in windows else None)
         assert body["secondaryUsedPercentAfter"] == (10.0 if "secondary" in windows else None)
         assert runtime.error_count == 0
         assert runtime.last_error_at is None
