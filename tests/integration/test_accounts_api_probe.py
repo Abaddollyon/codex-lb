@@ -36,6 +36,7 @@ def _encode_jwt(payload: dict) -> str:
 
 
 async def _import_test_account(async_client, *, email: str, account_id: str, plan_type: str = "pro") -> str:
+    """Import synthetic credentials through the API and return the stored account ID."""
     payload = {
         "email": email,
         "chatgpt_account_id": account_id,
@@ -81,9 +82,11 @@ async def test_force_probe_settles_after_repository_session_closes(
     """Exercise real rollback-on-close repositories, rather than a settlement mock."""
 
     async def _fake_probe(self, **kwargs):  # noqa: ARG001
+        """Accept the upstream probe without making a network request."""
         return 200
 
     async def _fake_fetch_usage(**_kwargs):
+        """Complete refresh without replacing the seeded usage-window rows."""
         return UsagePayload(plan_type=plan_type)
 
     monkeypatch.setattr(AccountsService, "_send_probe_request", _fake_probe)
@@ -137,9 +140,11 @@ async def test_force_probe_settlement_keeps_health_guard_after_real_session_expi
     """Pause after real rollback/close so newer evidence precedes the settlement CAS."""
 
     async def _fake_probe(self, **kwargs):  # noqa: ARG001
+        """Accept the probe before injecting a concurrent runtime observation."""
         return 200
 
     async def _fake_fetch_usage(**_kwargs):
+        """Leave quota unconstrained so the test isolates concurrent health evidence."""
         return UsagePayload(plan_type="pro")
 
     monkeypatch.setattr(AccountsService, "_send_probe_request", _fake_probe)
@@ -156,6 +161,7 @@ async def test_force_probe_settlement_keeps_health_guard_after_real_session_expi
 
     @asynccontextmanager
     async def _pause_after_session_closes():
+        """Block the first settlement after real ORM expiry; let subsequent writes finish."""
         nonlocal pause_once, account_snapshot
         should_pause = pause_once
         pause_once = False
@@ -204,10 +210,14 @@ async def test_force_probe_settlement_keeps_health_guard_after_real_session_expi
 async def test_failed_force_probe_resets_real_balancer_streak(
     async_client, app_instance, monkeypatch, caplog, probe_status
 ):
+    """Verify rejected probes reset recovery progress without marking the account unhealthy."""
+
     async def _fake_probe(self, **kwargs):  # noqa: ARG001
+        """Return the selected upstream rejection or network-failure status."""
         return probe_status
 
     async def _fake_fetch_usage(**_kwargs):
+        """Complete post-probe usage refresh without adding quota pressure."""
         return UsagePayload(plan_type="pro")
 
     monkeypatch.setattr(AccountsService, "_send_probe_request", _fake_probe)
