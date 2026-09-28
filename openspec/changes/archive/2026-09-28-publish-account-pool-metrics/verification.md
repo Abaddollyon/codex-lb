@@ -36,6 +36,15 @@ SQLite suite was rerun after replacing optional test skips with required imports
 and again passed all 54 tests. Independent source and contribution-guide review
 found no actionable issues after that test-coverage correction.
 
+The required-import correction exposed three type errors in hosted CI: the
+production `CollectorRegistryLike` protocol does not declare the `collect`
+method expected by Prometheus's ASGI factory. `uv run --frozen ty check`
+reproduced those same three diagnostics locally. The integration tests now
+assert that the production factory returns a real `CollectorRegistry` before
+passing it to Prometheus. This refines the test boundary without suppressing
+checks or changing the optional production dependency. The complete
+`uv run --frozen ty check` and the same 54 SQLite tests pass after this repair.
+
 The only pytest warning is the existing Starlette `BlockingPortal` deprecation.
 The full local CI gate was not run; hosted CI and current-head CodeRabbit review
 remain separate merge gates. This work has not changed or queried a running

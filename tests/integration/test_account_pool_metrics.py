@@ -23,6 +23,12 @@ from tests.simulation.virtual_time import VirtualClock
 pytestmark = pytest.mark.integration
 
 
+def _scrape_registry() -> prometheus_client.CollectorRegistry:
+    registry = metrics.make_scrape_registry()
+    assert isinstance(registry, prometheus_client.CollectorRegistry)
+    return registry
+
+
 def _account(account_id: str, status: AccountStatus, token: str = "unknown-expiry") -> Account:
     encryptor = TokenEncryptor()
     return Account(
@@ -88,7 +94,7 @@ async def test_lifespan_wires_fresh_account_metrics_into_standalone_scrape_app(a
 async def test_account_cache_refresh_populates_actual_metrics_scrape(db_setup, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(get_settings(), "metrics_enabled", True)
     cache = RoutingAvailabilityCache(SessionLocal)
-    app = prometheus_client.make_asgi_app(registry=metrics.make_scrape_registry())
+    app = prometheus_client.make_asgi_app(registry=_scrape_registry())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://metrics") as client:
         await cache.refresh_from_db()
         response = await client.get("/metrics")
@@ -120,7 +126,7 @@ async def test_scrape_refreshes_status_deletion_and_token_expiry_without_proxy_t
     clock = VirtualClock(epoch_value=2_000_000_000.0)
     cache = RoutingAvailabilityCache(SessionLocal, clock=clock)
     app = MetricsRefreshMiddleware(
-        prometheus_client.make_asgi_app(registry=metrics.make_scrape_registry()),
+        prometheus_client.make_asgi_app(registry=_scrape_registry()),
         refresh=cache.refresh_from_db,
     )
     future_token = jwt.encode({"exp": clock.time() + 60}, "test-key-with-at-least-32-characters", algorithm="HS256")
@@ -180,9 +186,7 @@ async def test_failed_metrics_refresh_does_not_expose_stale_account_counts(db_se
     async def fail_refresh() -> None:
         raise RuntimeError("database unavailable")
 
-    app = MetricsRefreshMiddleware(
-        prometheus_client.make_asgi_app(registry=metrics.make_scrape_registry()), refresh=fail_refresh
-    )
+    app = MetricsRefreshMiddleware(prometheus_client.make_asgi_app(registry=_scrape_registry()), refresh=fail_refresh)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://metrics") as client:
         response = await client.get("/metrics")
     assert response.status_code == 503
@@ -265,7 +269,7 @@ async def test_overlapping_scrape_and_invalidation_preserve_newer_snapshot_and_l
         await asyncio.gather(first, *([second] if second is not None else []), return_exceptions=True)
     assert calls == 2
     assert cache.is_unavailable("account") is True
-    app = prometheus_client.make_asgi_app(registry=metrics.make_scrape_registry())
+    app = prometheus_client.make_asgi_app(registry=_scrape_registry())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://metrics") as client:
         response = await client.get("/metrics")
     assert _samples(response.text) == _expected({AccountStatus.PAUSED: 1}, 0)
