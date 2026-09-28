@@ -24,12 +24,14 @@ pytestmark = pytest.mark.integration
 
 
 def _scrape_registry() -> prometheus_client.CollectorRegistry:
+    """Require a real Prometheus collector at the integration-test boundary."""
     registry = metrics.make_scrape_registry()
     assert isinstance(registry, prometheus_client.CollectorRegistry)
     return registry
 
 
 def _account(account_id: str, status: AccountStatus, token: str = "unknown-expiry") -> Account:
+    """Build encrypted account credentials with controlled access-token contents."""
     encryptor = TokenEncryptor()
     return Account(
         id=account_id,
@@ -44,6 +46,7 @@ def _account(account_id: str, status: AccountStatus, token: str = "unknown-expir
 
 
 def _samples(body: str) -> dict[tuple[str, tuple[tuple[str, str], ...]], float]:
+    """Read only account-pool series from real Prometheus exposition."""
     return {
         (sample.name, tuple(sorted(sample.labels.items()))): sample.value
         for family in text_string_to_metric_families(body)
@@ -53,6 +56,7 @@ def _samples(body: str) -> dict[tuple[str, tuple[tuple[str, str], ...]], float]:
 
 
 def _expected(counts: dict[AccountStatus, int], available: int) -> dict:
+    """Include every status so missing zeroes and stale values fail assertions."""
     return {
         **{("codex_lb_accounts_total", (("status", status.value),)): counts.get(status, 0) for status in AccountStatus},
         ("codex_lb_accounts_available", ()): available,
@@ -61,6 +65,7 @@ def _expected(counts: dict[AccountStatus, int], available: int) -> dict:
 
 @pytest.mark.asyncio
 async def test_lifespan_wires_fresh_account_metrics_into_standalone_scrape_app(app_instance, monkeypatch) -> None:
+    """Ensure production startup wires refreshes into the standalone metrics app."""
     import uvicorn
     from starlette.types import ASGIApp
 
@@ -69,10 +74,12 @@ async def test_lifespan_wires_fresh_account_metrics_into_standalone_scrape_app(a
 
     class CapturedMetricsServer:
         def __init__(self, config: uvicorn.Config) -> None:
+            """Capture the configured ASGI app without binding a host port."""
             apps.append(cast(ASGIApp, config.app))
             self.should_exit = False
 
         async def serve(self) -> None:
+            """Complete the server task without opening a listener."""
             return None
 
     monkeypatch.setattr("app.core.server.SignalNeutralServer", CapturedMetricsServer)
@@ -92,6 +99,7 @@ async def test_lifespan_wires_fresh_account_metrics_into_standalone_scrape_app(a
 
 @pytest.mark.asyncio
 async def test_account_cache_refresh_populates_actual_metrics_scrape(db_setup, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check every status and pending deletion through real metrics exposition."""
     monkeypatch.setattr(get_settings(), "metrics_enabled", True)
     cache = RoutingAvailabilityCache(SessionLocal)
     app = prometheus_client.make_asgi_app(registry=_scrape_registry())
@@ -120,6 +128,7 @@ async def test_account_cache_refresh_populates_actual_metrics_scrape(db_setup, m
 async def test_scrape_refreshes_status_deletion_and_token_expiry_without_proxy_traffic(
     db_setup, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Keep scrapes current across expiry and deletion without proxy traffic."""
     from app.core.metrics.middleware import MetricsRefreshMiddleware
 
     monkeypatch.setattr(get_settings(), "metrics_enabled", True)
@@ -174,6 +183,7 @@ async def test_scrape_refreshes_status_deletion_and_token_expiry_without_proxy_t
 
 @pytest.mark.asyncio
 async def test_failed_metrics_refresh_does_not_expose_stale_account_counts(db_setup, monkeypatch) -> None:
+    """Fail a scrape without returning stale counts or internal exception details."""
     from app.core.metrics.middleware import MetricsRefreshMiddleware
 
     monkeypatch.setattr(get_settings(), "metrics_enabled", True)
@@ -184,6 +194,7 @@ async def test_failed_metrics_refresh_does_not_expose_stale_account_counts(db_se
     await cache.refresh_from_db()
 
     async def fail_refresh() -> None:
+        """Model a failed database read after a populated snapshot."""
         raise RuntimeError("database unavailable")
 
     app = MetricsRefreshMiddleware(prometheus_client.make_asgi_app(registry=_scrape_registry()), refresh=fail_refresh)
@@ -199,6 +210,7 @@ async def test_failed_metrics_refresh_does_not_expose_stale_account_counts(db_se
 async def test_cache_refresh_skips_metric_token_decryption_when_disabled(
     db_setup, monkeypatch, prometheus_available: bool
 ) -> None:
+    """Preserve routing-cache reads without decryption when metrics are disabled."""
     monkeypatch.setattr(metrics, "PROMETHEUS_AVAILABLE", prometheus_available)
     monkeypatch.setattr(get_settings(), "metrics_enabled", not prometheus_available)
     async with SessionLocal() as session:
@@ -206,6 +218,7 @@ async def test_cache_refresh_skips_metric_token_decryption_when_disabled(
         await session.commit()
 
     def unexpected_encryptor():
+        """Reject decryption attempted by disabled metric publication."""
         raise AssertionError("disabled metrics must not decrypt tokens")
 
     monkeypatch.setattr("app.modules.proxy.account_cache.TokenEncryptor", unexpected_encryptor)
@@ -219,6 +232,7 @@ async def test_cache_refresh_skips_metric_token_decryption_when_disabled(
 async def test_overlapping_scrape_and_invalidation_preserve_newer_snapshot_and_local_mark(
     db_setup, monkeypatch
 ) -> None:
+    """Prevent an old read from overwriting a committed pause or its local mark."""
     monkeypatch.setattr(get_settings(), "metrics_enabled", True)
     read_started = asyncio.Event()
     release_read = asyncio.Event()
@@ -228,20 +242,24 @@ async def test_overlapping_scrape_and_invalidation_preserve_newer_snapshot_and_l
 
     class DelayedSession:
         def __init__(self, session: AsyncSession) -> None:
+            """Wrap one real database session for a controllable refresh race."""
             self.inner = session
 
         async def execute(self, statement):
+            """Hold the first read result until a newer status is committed."""
             result = await self.inner.execute(statement)
             read_started.set()
             await release_read.wait()
             return result
 
         def __getattr__(self, name: str):
+            """Preserve the real session's cleanup and transaction interface."""
             return getattr(self.inner, name)
 
     calls = 0
 
     def session_factory() -> AsyncSession:
+        """Delay only the initial read so the next refresh can observe the pause."""
         nonlocal calls
         calls += 1
         session = SessionLocal()

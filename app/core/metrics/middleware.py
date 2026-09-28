@@ -23,10 +23,12 @@ class MetricsRefreshMiddleware:
     """Refresh shared inventory before exposing it, including on quiet replicas."""
 
     def __init__(self, app: ASGIApp, *, refresh: Callable[[], Awaitable[None]]) -> None:
+        """Pair metrics exposition with an awaitable inventory refresh."""
         self.app = app
         self.refresh = refresh
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Refresh HTTP scrapes and fail closed when inventory cannot be read."""
         if scope["type"] == "http" and scope.get("method") in {"GET", "HEAD"}:
             try:
                 await self.refresh()
